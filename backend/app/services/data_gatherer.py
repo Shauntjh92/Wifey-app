@@ -35,6 +35,24 @@ REQUEST_TIMEOUT = 15
 INTER_REQUEST_DELAY = 1.0
 MAX_RETRIES = 3
 
+CAPITALAND_BASE = "https://www.capitaland.com"
+CAPITALAND_MALLS_URL = f"{CAPITALAND_BASE}/sg/en/shop/malls.html"
+CAPITALAND_PLAYWRIGHT_TIMEOUT = 30000  # ms
+
+CAPITALAND_CATEGORY_MAP = {
+    "fnb": "Food & Beverage",
+    "beautyandwellness": "Beauty & Wellness",
+    "fashion": "Fashion",
+    "lifestyle": "Lifestyle",
+    "entertainment": "Entertainment",
+    "services": "Services",
+    "homeandliving": "Home & Living",
+    "sportsandleisure": "Sports & Leisure",
+    "jewelryandaccessories": "Jewelry & Accessories",
+    "kidsandbabies": "Kids & Babies",
+    "educationandlearning": "Education & Learning",
+}
+
 REGION_HEADING_MAP = {
     "Central Region": "Central",
     "North Region": "North",
@@ -245,6 +263,195 @@ def _scrape_wiki_region_map(session: requests.Session) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# CapitaLand scrapers
+# ---------------------------------------------------------------------------
+
+def _scrape_capitaland_mall_list(session: requests.Session) -> list:
+    """
+    Fetch CapitaLand malls index (SSR) and return
+    [{"name": str, "slug": str, "address": str}] dicts.
+    Links in the page are shaped like /sg/malls/{slug}/en.html.
+    """
+    resp = _http_get(CAPITALAND_MALLS_URL, session)
+    if not resp:
+        logger.warning("CapitaLand: failed to fetch malls index")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    result = []
+    seen_slugs: set = set()
+    slug_re = re.compile(r"/sg/malls/([^/]+)/en\.html")
+
+    for a in soup.find_all("a", href=True):
+        m = slug_re.search(a["href"])
+        if not m:
+            continue
+        slug = m.group(1)
+        if slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+
+        # Prefer link text; fall back to nearest heading; finally humanise slug
+        name = a.get_text(strip=True)
+        if not name:
+            for parent in a.parents:
+                h = parent.find(["h2", "h3", "h4"])
+                if h:
+                    name = h.get_text(strip=True)
+                    break
+        if not name:
+            name = slug.replace("-", " ").title()
+
+        result.append({"name": name, "slug": slug, "address": ""})
+
+    logger.info(f"CapitaLand: found {len(result)} malls")
+    return result
+
+
+def _parse_capitaland_api_stores(data: dict) -> list:
+    """
+    Parse the CapitaLand paginated tenant API response.
+    Expected format: {"totalcount": N, "properties": [...]}
+    Each item: {"jcr:title": str, "unitnumber": [...], "marketingcategory": [...]}
+    """
+    items = data.get("properties", [])
+    if not isinstance(items, list):
+        return []
+
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        # Name
+        name = (item.get("jcr:title") or "").strip()
+        if not name:
+            details = item.get("_rel_brandtenants_details", [])
+            if details and isinstance(details, list) and isinstance(details[0], dict):
+                name = (details[0].get("jcr:title") or "").strip()
+        if not name:
+            continue
+
+        # Unit: tag-path like "…/unit-03-k1" → "#03-K1"
+        unit = None
+        unit_list = item.get("unitnumber", [])
+        if unit_list and isinstance(unit_list, list):
+            segment = unit_list[0].split("/")[-1]
+            segment = re.sub(r"^unit-", "", segment, flags=re.IGNORECASE)
+            unit = "#" + segment.upper()
+
+        # Category: tag-path, second-to-last segment → human label
+        category = None
+        cat_list = item.get("marketingcategory", [])
+        if cat_list and isinstance(cat_list, list):
+            parts = cat_list[0].split("/")
+            raw_key = parts[-2] if len(parts) >= 2 else parts[0]
+            cat_key = raw_key.lower().replace("-", "").replace(" ", "")
+            category = CAPITALAND_CATEGORY_MAP.get(cat_key) or raw_key.replace("-", " ").title()
+
+        result.append({"name": name, "category": category, "unit": unit})
+
+    return result
+
+
+def _scrape_capitaland_stores(mall_slug: str) -> list:
+    """
+    Use Playwright (headless Chromium) to load a CapitaLand store-directory
+    page, intercept the paginated tenant API response (api-v1/.../tenants/...),
+    and paginate through all results using browser fetch (preserving cookies).
+    Returns [{"name": str, "category": str|None, "unit": str|None}].
+    """
+    url = f"{CAPITALAND_BASE}/sg/malls/{mall_slug}/en/stores.html"
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning("playwright not installed — skipping CapitaLand store scraping. "
+                       "Run: .venv/bin/pip install playwright && "
+                       ".venv/bin/python -m playwright install chromium")
+        return []
+
+    first_api_url: Optional[str] = None
+    first_data: Optional[dict] = None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=REQUEST_HEADERS["User-Agent"],
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+
+            def handle_response(response):
+                nonlocal first_api_url, first_data
+                if first_data is not None:
+                    return  # already captured the first paginated response
+                ct = response.headers.get("content-type", "")
+                if "json" not in ct:
+                    return
+                resp_url = response.url
+                if "api-v1" not in resp_url or "tenants" not in resp_url:
+                    return
+                try:
+                    data = response.json()
+                    if isinstance(data, dict) and "totalcount" in data:
+                        first_api_url = resp_url
+                        first_data = data
+                except Exception:
+                    pass
+
+            page.on("response", handle_response)
+
+            try:
+                page.goto(url, timeout=CAPITALAND_PLAYWRIGHT_TIMEOUT,
+                          wait_until="domcontentloaded")
+            except Exception as e:
+                logger.warning(f"CapitaLand: page load issue for {mall_slug}: {e}")
+
+            # Fixed wait replaces networkidle — avoids New Relic beacon timeouts
+            page.wait_for_timeout(8000)
+
+            if first_data is None:
+                logger.warning(f"CapitaLand: no API response captured for {mall_slug}")
+                browser.close()
+                return []
+
+            all_stores = _parse_capitaland_api_stores(first_data)
+            total_count = first_data.get("totalcount", 0)
+            logger.info(
+                f"CapitaLand {mall_slug}: totalcount={total_count}, "
+                f"first page={len(all_stores)} stores"
+            )
+
+            # Paginate remaining pages via browser fetch (preserves session cookies)
+            if total_count > 100:
+                base_url = re.sub(r"/cl%3Apgcursor/\d+/\d+\.json$", "", first_api_url)
+                if base_url != first_api_url:
+                    for start in range(101, total_count + 1, 100):
+                        page_url = f"{base_url}/cl%3Apgcursor/{start}/100.json"
+                        try:
+                            result = page.evaluate(
+                                f'fetch("{page_url}", {{credentials:"include"}}).then(r=>r.json())'
+                            )
+                            page_stores = _parse_capitaland_api_stores(result)
+                            all_stores.extend(page_stores)
+                            logger.info(
+                                f"  → Page starting at {start}: {len(page_stores)} stores"
+                            )
+                        except Exception as e:
+                            logger.warning(f"  → Pagination failed at start={start}: {e}")
+                            break
+
+            browser.close()
+    except Exception as e:
+        logger.warning(f"CapitaLand: Playwright error for {mall_slug}: {e}")
+        return []
+
+    return all_stores
+
+
+# ---------------------------------------------------------------------------
 # Region helpers
 # ---------------------------------------------------------------------------
 
@@ -347,7 +554,12 @@ def _upsert_mall_store(db: Session, mall: Mall, store: Store, floor: Optional[st
 # ---------------------------------------------------------------------------
 
 def run_gather_job(job_id: str):
-    """Main background job. Scrapes malls from singmalls.app then saves store directories."""
+    """
+    Main background job.
+    Phase 1: fetch mall + region lists.
+    Phase 2: scrape SingMalls store directories.
+    Phase 3: scrape CapitaLand store directories via Playwright.
+    """
     _update_state(job_id=job_id, status="running", total_malls=0, completed_malls=0,
                   current_mall=None, error=None)
 
@@ -355,7 +567,7 @@ def run_gather_job(job_id: str):
     http = requests.Session()
 
     try:
-        # Phase 1: Fetch mall list and region map
+        # Phase 1: Fetch mall lists and region map
         logger.info("Phase 1: Scraping mall list from singmalls.app...")
         _update_state(current_mall="Fetching mall list...")
         raw_malls = _scrape_singmalls_mall_list(http)
@@ -368,17 +580,25 @@ def run_gather_job(job_id: str):
         _update_state(current_mall="Fetching region data...")
         wiki_map = _scrape_wiki_region_map(http)
 
-        _update_state(total_malls=len(raw_malls))
-        logger.info(f"Phase 1 complete: {len(raw_malls)} malls found")
+        logger.info("Phase 1: Fetching CapitaLand mall list...")
+        _update_state(current_mall="Fetching CapitaLand mall list...")
+        capitaland_malls = _scrape_capitaland_mall_list(http)
 
-        # Phase 2: For each mall, upsert and scrape store directory
+        total = len(raw_malls) + len(capitaland_malls)
+        _update_state(total_malls=total)
+        logger.info(
+            f"Phase 1 complete: {len(raw_malls)} SingMalls + "
+            f"{len(capitaland_malls)} CapitaLand = {total} total malls"
+        )
+
+        # Phase 2: SingMalls store directories
         for i, raw in enumerate(raw_malls):
             mall_name = raw.get("name", "").strip()
             if not mall_name:
                 continue
 
             _update_state(current_mall=mall_name, completed_malls=i)
-            logger.info(f"[{i+1}/{len(raw_malls)}] Processing: {mall_name}")
+            logger.info(f"[{i+1}/{len(raw_malls)}] SingMalls: {mall_name}")
 
             mall_data = _build_mall_data(raw, wiki_map)
             mall = _upsert_mall(db, mall_data)
@@ -402,7 +622,60 @@ def run_gather_job(job_id: str):
 
             time.sleep(INTER_REQUEST_DELAY)
 
-        _update_state(status="done", completed_malls=len(raw_malls), current_mall=None)
+        singmalls_done = len(raw_malls)
+
+        # Phase 3: CapitaLand store directories (Playwright)
+        if capitaland_malls:
+            logger.info(
+                f"Phase 3: Scraping store directories for "
+                f"{len(capitaland_malls)} CapitaLand malls via Playwright..."
+            )
+            for j, mall_info in enumerate(capitaland_malls):
+                mall_name = mall_info["name"]
+                _update_state(
+                    current_mall=f"[CapitaLand] {mall_name}",
+                    completed_malls=singmalls_done + j,
+                )
+                logger.info(
+                    f"[CapitaLand {j+1}/{len(capitaland_malls)}] Processing: {mall_name}"
+                )
+
+                address = mall_info.get("address") or ""
+                mall_data = {
+                    "name": mall_name,
+                    "address": address or None,
+                    "region": (
+                        wiki_map.get(_normalize(mall_name))
+                        or _infer_region_from_address(address)
+                    ),
+                    "website": (
+                        f"{CAPITALAND_BASE}/sg/malls/{mall_info['slug']}/en.html"
+                    ),
+                }
+                mall = _upsert_mall(db, mall_data)
+                if not mall:
+                    continue
+
+                try:
+                    stores = _scrape_capitaland_stores(mall_info["slug"])
+                    for s in stores:
+                        store_name = s.get("name", "").strip()
+                        if not store_name:
+                            continue
+                        unit = s.get("unit")
+                        floor = _parse_floor_from_unit(unit)
+                        store = _upsert_store(db, store_name, s.get("category"))
+                        _upsert_mall_store(db, mall, store, floor, unit)
+
+                    logger.info(f"  → Saved {len(stores)} stores for {mall_name}")
+                except Exception as e:
+                    logger.warning(
+                        f"  → Failed to scrape CapitaLand stores for {mall_name}: {e}"
+                    )
+
+                time.sleep(INTER_REQUEST_DELAY)
+
+        _update_state(status="done", completed_malls=total, current_mall=None)
         logger.info("Data gathering complete.")
 
     except Exception as e:

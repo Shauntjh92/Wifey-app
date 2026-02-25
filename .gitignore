@@ -36,3 +36,6 @@ npm-debug.log*
 
 # Claude local context (not project code)
 .claude/
+
+# One-time utility scripts
+push_to_github.sh
