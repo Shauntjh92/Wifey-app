@@ -111,12 +111,23 @@ cd backend
 Phase 3 of the gather job will skip CapitaLand malls silently if Playwright is not installed.
 
 ### Deployment
-A `vercel.json` is present at the repo root for Vercel deployments. It configures a SPA rewrite rule so all routes resolve to `index.html`:
+The frontend is deployed to Vercel. Live URL: **https://wifey-app-three.vercel.app**
+
+`vercel.json` at the repo root builds the React frontend and serves it as a SPA:
 ```json
 {
-  "buildCommand": "",
-  "outputDirectory": ".",
+  "buildCommand": "cd frontend && npm install && npm run build",
+  "outputDirectory": "frontend/dist",
   "framework": null,
   "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
 ```
+
+Vercel is connected to the GitHub repo — every push to `main` triggers an automatic redeploy.
+
+To redeploy manually:
+```bash
+~/.npm-global/bin/vercel --prod --yes
+```
+
+> Note: Only the frontend is deployed to Vercel. The backend (FastAPI) and database (PostgreSQL) must be run locally or hosted separately.
