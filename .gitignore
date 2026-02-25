@@ -39,3 +39,4 @@ npm-debug.log*
 
 # One-time utility scripts
 push_to_github.sh
+.vercel
