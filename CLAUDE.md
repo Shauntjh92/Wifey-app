@@ -40,9 +40,6 @@ npm run build    # production build (output: dist/)
 ```bash
 docker-compose up -d      # start postgres on :5432
 docker-compose down       # stop and remove container (data volume persists)
-
-# Seed test data without OpenAI credits
-cd backend && .venv/bin/python3 -c "..."   # see README for seed script
 ```
 
 ## Architecture
@@ -66,7 +63,7 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 
 **Search** (per user query):
 1. `POST /api/search` with `{"stores": ["Uniqlo", "Starbaks"]}` hits `services/store_matcher.py`
-2. All store names are fetched from DB, then a single `gpt-4o` call fuzzy-matches user input to DB entries (handles typos/aliases). Falls back to exact normalized match if OpenAI is unavailable.
+2. All store names are fetched from DB and matched against user input using exact normalized matching (lowercased, punctuation stripped). No external API is used.
 3. A SQL query finds all `mall_stores` rows matching the resolved store IDs, groups by mall, sorts by match count descending.
 
 **Frontend proxy**: Vite dev server proxies `/api/*` → `http://localhost:8000`, so all fetch calls use relative `/api/...` paths with no CORS concerns during development.
@@ -78,7 +75,7 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 | `backend/app/models.py` | SQLAlchemy ORM: `Mall`, `Store`, `MallStore` (junction with `UNIQUE(mall_id, store_id)`) |
 | `backend/app/schemas.py` | Pydantic v2 schemas for all request/response types |
 | `backend/app/services/data_gatherer.py` | Web scraping pipeline (requests + BS4 + Playwright) + DB upsert logic. Key functions: `_scrape_capitaland_stores` (Playwright, paginated API), `_parse_capitaland_api_stores` (parses `jcr:title`/`unitnumber`/`marketingcategory`), `CAPITALAND_CATEGORY_MAP` |
-| `backend/app/services/store_matcher.py` | OpenAI fuzzy match + SQL rank query |
+| `backend/app/services/store_matcher.py` | Exact normalized match + SQL rank query (no external API) |
 | `backend/app/routers/` | Thin route handlers — logic lives in services |
 | `frontend/src/api/client.js` | Single fetch wrapper used by all components |
 | `frontend/src/pages/Admin.jsx` | Triggers gather job, polls `/api/data/status` every 2s |
@@ -88,10 +85,12 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 ### Environment
 `backend/.env` is read at startup via `python-dotenv`. **Restart the backend after editing `.env`** — hot-reload does not re-read it.
 
-Required variables:
+No API keys are required. The only required variable is:
 ```
 DATABASE_URL=postgresql://postgres:password@localhost:5432/malldb
 ```
+
+> API keys (Anthropic, OpenAI) have been removed from this project. The `.env` and `.env.example` files no longer contain any key entries.
 
 ### Python environment
 The venv lives at `backend/.venv`. Always invoke Python/pip via `.venv/bin/python` / `.venv/bin/pip`. The project targets Python 3.9 — use `Optional[X]` not `X | None`.
@@ -110,3 +109,14 @@ cd backend
 .venv/bin/python -m playwright install chromium
 ```
 Phase 3 of the gather job will skip CapitaLand malls silently if Playwright is not installed.
+
+### Deployment
+A `vercel.json` is present at the repo root for Vercel deployments. It configures a SPA rewrite rule so all routes resolve to `index.html`:
+```json
+{
+  "buildCommand": "",
+  "outputDirectory": ".",
+  "framework": null,
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+}
+```
