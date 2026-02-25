@@ -91,7 +91,6 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 Required variables:
 ```
 DATABASE_URL=postgresql://postgres:password@localhost:5432/malldb
-OPENAI_API_KEY=sk-...
 ```
 
 ### Python environment

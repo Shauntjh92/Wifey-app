@@ -11,7 +11,6 @@ Find which Singapore shopping malls have all the stores you want to visit — in
 | Node.js | 18.x | `node --version` |
 | Python | 3.9+ | `python --version` |
 | Docker + Docker Compose | any recent | `docker --version` |
-| OpenAI API key | — | [platform.openai.com](https://platform.openai.com) |
 
 ---
 
@@ -30,11 +29,10 @@ cd wifey-app
 cp backend/.env.example backend/.env
 ```
 
-Open `backend/.env` and fill in your key:
+Open `backend/.env` and confirm the database URL:
 
 ```
 DATABASE_URL=postgresql://postgres:password@localhost:5432/malldb
-OPENAI_API_KEY=sk-...
 ```
 
 ### 3. Start the database
@@ -164,7 +162,7 @@ wifey-app/
 Make sure Docker is running and the database container is up: `docker-compose up -d`
 
 **Data gathering fails immediately**
-Check that `OPENAI_API_KEY` is set correctly in `backend/.env`.
+Check that the backend is running and the database container is up.
 
 **Search returns no results**
 Data has not been gathered yet, or gathering did not complete successfully. Go to `/admin` and run the gather job again.
