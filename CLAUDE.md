@@ -53,13 +53,16 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 
 **Data gathering** (one-time, admin-triggered):
 1. `POST /api/data/gather` kicks off a FastAPI `BackgroundTask` in `services/data_gatherer.py`
-2. The job scrapes three sources (no OpenAI cost):
-   - **singmalls.app/en/malls** — full mall list from `pageProps.sites` in the embedded `__NEXT_DATA__` JSON
-   - **singmalls.app/en/malls/{slug}/directory** — per-mall store directory from `pageProps.merchants`
-   - **Wikipedia List_of_shopping_malls_in_Singapore** — region mapping (Central/East/North/North-East/West); falls back to postal-code prefix if a mall isn't listed
+2. The job runs in three phases:
+   - **Phase 1** — fetch mall lists + region map:
+     - **singmalls.app/en/malls** — full mall list from `pageProps.sites` in the embedded `__NEXT_DATA__` JSON
+     - **Wikipedia List_of_shopping_malls_in_Singapore** — region mapping (Central/East/North/North-East/West); falls back to postal-code prefix if a mall isn't listed
+     - **capitaland.com/sg/en/shop/malls.html** — CapitaLand mall list (slugs extracted from `/sg/malls/{slug}/en.html` links)
+   - **Phase 2** — per-mall store directories from `singmalls.app/en/malls/{slug}/directory` (`pageProps.merchants`)
+   - **Phase 3** — CapitaLand store directories via **Playwright** (headless Chromium): loads `capitaland.com/sg/malls/{slug}/en/stores.html`, waits 8 s after `domcontentloaded` (fixed wait — avoids New Relic beacon timeouts), intercepts the first JSON response matching `api-v1` + `tenants` in the URL, paginates via `page.evaluate('fetch(..., {credentials:"include"})')`. Each mall returns 100–300 stores.
 3. Results are upserted into PostgreSQL via SQLAlchemy. Stores are deduplicated by `normalized_name` (lowercased, punctuation stripped). Progress is tracked in a module-level `_job_state` dict (single-process only).
 4. `GET /api/data/status` polls this dict — the Admin page polls it every 2 seconds.
-5. Gather takes ~3 minutes for all ~106 malls (1 s polite delay per mall).
+5. Gather takes ~6 minutes for all ~121 malls (106 SingMalls + 15 CapitaLand; 1 s polite delay per mall).
 
 **Search** (per user query):
 1. `POST /api/search` with `{"stores": ["Uniqlo", "Starbaks"]}` hits `services/store_matcher.py`
@@ -74,7 +77,7 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 |------|---------|
 | `backend/app/models.py` | SQLAlchemy ORM: `Mall`, `Store`, `MallStore` (junction with `UNIQUE(mall_id, store_id)`) |
 | `backend/app/schemas.py` | Pydantic v2 schemas for all request/response types |
-| `backend/app/services/data_gatherer.py` | Web scraping pipeline (requests + BS4) + DB upsert logic |
+| `backend/app/services/data_gatherer.py` | Web scraping pipeline (requests + BS4 + Playwright) + DB upsert logic. Key functions: `_scrape_capitaland_stores` (Playwright, paginated API), `_parse_capitaland_api_stores` (parses `jcr:title`/`unitnumber`/`marketingcategory`), `CAPITALAND_CATEGORY_MAP` |
 | `backend/app/services/store_matcher.py` | OpenAI fuzzy match + SQL rank query |
 | `backend/app/routers/` | Thin route handlers — logic lives in services |
 | `frontend/src/api/client.js` | Single fetch wrapper used by all components |
@@ -99,3 +102,12 @@ Node 18.x is the system version. The frontend is pinned to **Vite 5** and **Tail
 
 ### DB tables auto-created
 `Base.metadata.create_all(bind=engine)` runs on every backend startup via the `lifespan` handler. Alembic is available for schema migrations but not required for initial setup.
+
+### Playwright (CapitaLand scraping)
+`playwright==1.49.0` is in `backend/requirements.txt`. Chromium must be installed separately:
+```bash
+cd backend
+.venv/bin/pip install playwright
+.venv/bin/python -m playwright install chromium
+```
+Phase 3 of the gather job will skip CapitaLand malls silently if Playwright is not installed.
