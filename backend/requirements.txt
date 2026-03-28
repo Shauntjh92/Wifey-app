@@ -8,3 +8,4 @@ beautifulsoup4==4.12.3
 python-dotenv==1.0.1
 pydantic==2.10.2
 playwright==1.49.0
+rapidfuzz==3.10.0

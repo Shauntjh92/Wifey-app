@@ -1,10 +1,12 @@
 """
 Store matching service.
-Uses normalized exact matching to resolve user input against DB store names.
+Uses normalized exact matching with fuzzy fallback to resolve user input against DB store names.
 """
 import logging
 import re
 from uuid import UUID
+
+from rapidfuzz import process, fuzz
 
 from sqlalchemy.orm import Session
 
@@ -75,15 +77,38 @@ def match_and_search(db: Session, user_stores: list[str]) -> SearchResponse:
     return SearchResponse(results=results, unmatched_stores=unmatched)
 
 
+FUZZY_THRESHOLD = 80.0
+
+
+def _normalize(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
 def _fallback_match(db: Session, user_stores: list[str], store_name_map: dict) -> list[MatchedStore]:
-    """Simple normalized-name exact match fallback."""
+    """Normalized exact match with rapidfuzz fallback for typos/abbreviations."""
     results = []
+    normalized_keys = list(store_name_map.keys())
     for name in user_stores:
-        norm = re.sub(r"[^a-z0-9]", "", name.lower())
+        norm = _normalize(name)
+        # Try exact match first
         store = store_name_map.get(norm)
         if store:
             results.append(MatchedStore(
                 requested=name, matched_id=store.id, matched_name=store.name, found=True
+            ))
+            continue
+        # Fuzzy fallback
+        match = process.extractOne(
+            norm,
+            normalized_keys,
+            scorer=fuzz.partial_ratio,
+            score_cutoff=FUZZY_THRESHOLD,
+        )
+        if match:
+            fuzzy_store = store_name_map[match[0]]
+            logger.debug("Fuzzy matched %r → %r (score %.1f)", name, fuzzy_store.name, match[1])
+            results.append(MatchedStore(
+                requested=name, matched_id=fuzzy_store.id, matched_name=fuzzy_store.name, found=True
             ))
         else:
             results.append(MatchedStore(requested=name, found=False))
