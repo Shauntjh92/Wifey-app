@@ -63,7 +63,7 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 
 **Search** (per user query):
 1. `POST /api/search` with `{"stores": ["Uniqlo", "Starbaks"]}` hits `services/store_matcher.py`
-2. All store names are fetched from DB and matched against user input using exact normalized matching (lowercased, punctuation stripped). No external API is used.
+2. All store names are fetched from DB and matched against user input using a two-step approach: exact normalized match first, then `rapidfuzz` fuzzy fallback (`partial_ratio`, 80% threshold) for typos/abbreviations (e.g. "Starbux" → Starbucks). No external API is used.
 3. A SQL query finds all `mall_stores` rows matching the resolved store IDs, groups by mall, sorts by match count descending.
 
 **Frontend proxy**: Vite dev server proxies `/api/*` → `http://localhost:8000`, so all fetch calls use relative `/api/...` paths with no CORS concerns during development.
@@ -75,12 +75,12 @@ The app has three layers that must all be running: PostgreSQL (Docker), FastAPI 
 | `backend/app/models.py` | SQLAlchemy ORM: `Mall`, `Store`, `MallStore` (junction with `UNIQUE(mall_id, store_id)`) |
 | `backend/app/schemas.py` | Pydantic v2 schemas for all request/response types |
 | `backend/app/services/data_gatherer.py` | Web scraping pipeline (requests + BS4 + Playwright) + DB upsert logic. Key functions: `_scrape_capitaland_stores` (Playwright, paginated API), `_parse_capitaland_api_stores` (parses `jcr:title`/`unitnumber`/`marketingcategory`), `CAPITALAND_CATEGORY_MAP` |
-| `backend/app/services/store_matcher.py` | Exact normalized match + SQL rank query (no external API) |
+| `backend/app/services/store_matcher.py` | Exact normalized match + `rapidfuzz` fuzzy fallback (80% threshold) + SQL rank query |
 | `backend/app/routers/` | Thin route handlers — logic lives in services |
 | `frontend/src/api/client.js` | Single fetch wrapper used by all components |
 | `frontend/src/pages/Admin.jsx` | Triggers gather job, polls `/api/data/status` every 2s |
 | `frontend/src/pages/Home.jsx` | Tag-chip store input + calls `/api/search` |
-| `frontend/src/components/StoreSearch.jsx` | Tag-chip input with autocomplete dropdown — fetches all stores from `/api/stores` on mount, filters client-side as user types (starts-with ranked above contains, max 8 suggestions), supports arrow-key navigation and click-to-select |
+| `frontend/src/components/StoreSearch.jsx` | Tag-chip input with autocomplete dropdown — fetches all stores from `/api/stores` on mount (retries up to 3× at 10s intervals to handle Render cold starts), filters client-side as user types (starts-with ranked above contains, max 8 suggestions), supports arrow-key navigation and click-to-select |
 
 ### Environment
 `backend/.env` is read at startup via `python-dotenv`. **Restart the backend after editing `.env`** — hot-reload does not re-read it.
@@ -111,7 +111,29 @@ cd backend
 Phase 3 of the gather job will skip CapitaLand malls silently if Playwright is not installed.
 
 ### Deployment
-The frontend is deployed to Vercel. Live URL: **https://wifey-app-three.vercel.app**
+
+| Layer | Platform | URL |
+|-------|----------|-----|
+| Frontend | Vercel | **https://sg-shopping-goto.vercel.app** |
+| Backend (FastAPI) | Render (free) | **https://wifey-app.onrender.com** |
+| Database (PostgreSQL) | Neon (free) | configured via `DATABASE_URL` env var |
+
+**Vercel** is connected to the GitHub repo — every push to `main` triggers an automatic frontend redeploy.
+
+Required Vercel environment variable:
+```
+VITE_API_BASE_URL=https://wifey-app.onrender.com
+```
+
+**Render** auto-deploys from `main` via `render.yaml`. Python version is pinned to 3.11.9 via `backend/.python-version`.
+
+Required Render environment variables:
+```
+DATABASE_URL=<neon connection string>
+ALLOWED_ORIGINS=https://sg-shopping-goto.vercel.app
+```
+
+> Render free tier sleeps after 15 min of inactivity — first request after sleep takes ~30s. The frontend retries the `/api/stores` fetch up to 3 times to handle this cold start.
 
 `vercel.json` at the repo root builds the React frontend and serves it as a SPA:
 ```json
@@ -122,12 +144,3 @@ The frontend is deployed to Vercel. Live URL: **https://wifey-app-three.vercel.a
   "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
 }
 ```
-
-Vercel is connected to the GitHub repo — every push to `main` triggers an automatic redeploy.
-
-To redeploy manually:
-```bash
-~/.npm-global/bin/vercel --prod --yes
-```
-
-> Note: Only the frontend is deployed to Vercel. The backend (FastAPI) and database (PostgreSQL) must be run locally or hosted separately.
