@@ -27,9 +27,17 @@ export default function StoreSearch({ stores, onChange }) {
   const inputRef = useRef(null)
 
   useEffect(() => {
-    api.getStores().then((data) => {
-      setAllStores(data.map((s) => s.name))
-    }).catch(() => {})
+    let cancelled = false
+    function load(attempt = 0) {
+      api.getStores()
+        .then((data) => { if (!cancelled) setAllStores(data.map((s) => s.name)) })
+        .catch(() => {
+          // Render free tier cold start can take 30-60s — retry up to 3 times
+          if (!cancelled && attempt < 3) setTimeout(() => load(attempt + 1), 10000)
+        })
+    }
+    load()
+    return () => { cancelled = true }
   }, [])
 
   useEffect(() => {
@@ -124,7 +132,7 @@ export default function StoreSearch({ stores, onChange }) {
           onKeyDown={handleKeyDown}
           onBlur={handleBlur}
           onFocus={() => { if (suggestions.length > 0) setShowDropdown(true) }}
-          placeholder={stores.length === 0 ? 'Type a store name and press Enter…' : 'Add another store…'}
+          placeholder={stores.length === 0 ? (allStores.length === 0 ? 'Loading stores…' : 'Type a store name and press Enter…') : 'Add another store…'}
           className="flex-1 min-w-32 outline-none text-sm text-gray-700 placeholder-gray-400 bg-transparent"
         />
       </div>
