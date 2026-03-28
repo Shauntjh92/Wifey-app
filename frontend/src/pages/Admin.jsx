@@ -28,8 +28,11 @@ export default function Admin() {
   }
 
   useEffect(() => {
-    // Load initial status
-    api.getStatus().then(setStatus).catch(() => {})
+    // Load initial status and auto-poll if a job is already running
+    api.getStatus().then(s => {
+      setStatus(s)
+      if (s.status === 'running') startPolling()
+    }).catch(() => {})
     return () => stopPolling()
   }, [])
 
